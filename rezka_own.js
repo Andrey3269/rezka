@@ -4,7 +4,7 @@
   if (window.rezka_own_plugin) return;
   window.rezka_own_plugin = true;
 
-  var VERSION = '1.2.0';
+  var VERSION = '1.3.0';
   var DEFAULT_HOST = 'https://rezka.fi';
   var pending = [];     // активные запросы (чтобы можно было отменить)
 
@@ -164,47 +164,138 @@
 
   /* ====================================================================
    *  Rezka: поиск
+   *  Как в BWA: несколько запросов (рус. + оригинальное название),
+   *  все страницы выдачи, отбор по году и типу (фильм/сериал).
    * ==================================================================== */
 
-  function search(query, ok, fail) {
-    request(host() + '/search/?do=search&subaction=search&q=' + encodeURIComponent(query), false, function (html) {
-      var doc = dom(html), list = [];
+  var CAT_SERIAL = /\/(series|cartoons|animation)\//i;
+  var CAT_FILM = /\/(films|cartoons|animation)\//i;
 
-      qsa(doc, '.b-content__inline_item').forEach(function (el) {
-        var a = el.querySelector('.b-content__inline_item-link a');
-        var info = el.querySelector('.b-content__inline_item-link div');
-        var url = el.getAttribute('data-url') || (a && a.getAttribute('href'));
-        if (!a || !url) return;
+  function searchUrl(q) {
+    return host() + '/search/?do=search&subaction=search&q=' + encodeURIComponent(q);
+  }
 
-        var infoText = info ? info.textContent.replace(/^\s+|\s+$/g, '') : '';
-        var ym = infoText.match(/(\d{4})/);
+  function uniq(arr) {
+    var out = [];
+    arr.forEach(function (x) {
+      x = (x || '').replace(/^\s+|\s+$/g, '');
+      if (x && out.indexOf(x) < 0) out.push(x);
+    });
+    return out;
+  }
 
-        list.push({
-          id: el.getAttribute('data-id') || '',
-          url: abs(url),
-          title: a.textContent.replace(/^\s+|\s+$/g, ''),
-          year: ym ? ym[1] : '',
-          info: infoText
-        });
+  // «Форсаж: Хоббс и Шоу» -> «Форсаж» (Rezka часто называет иначе после двоеточия)
+  function shortTitle(s) {
+    var p = String(s || '').split(/\s*[:—–]\s*|\s+-\s+/)[0];
+    return p.length >= 3 && p !== s ? p : '';
+  }
+
+  function cleanTitle(s) {
+    return String(s || '').replace(/\(\s*\d{4}[^)]*\)/g, ' ');
+  }
+
+  function parseSearch(html) {
+    var doc = dom(html), list = [], pages = [];
+
+    qsa(doc, '.b-content__inline_item').forEach(function (el) {
+      var a = el.querySelector('.b-content__inline_item-link a');
+      var info = el.querySelector('.b-content__inline_item-link div');
+      var url = el.getAttribute('data-url') || (a && a.getAttribute('href'));
+      if (!a || !url) return;
+
+      var infoText = info ? info.textContent.replace(/^\s+|\s+$/g, '') : '';
+      var ym = infoText.match(/(\d{4})/);
+
+      list.push({
+        id: el.getAttribute('data-id') || '',
+        url: abs(url),
+        title: a.textContent.replace(/^\s+|\s+$/g, ''),
+        year: ym ? ym[1] : '',
+        info: infoText
       });
+    });
 
-      ok(list);
+    // Ссылки на следующие страницы выдачи
+    qsa(doc, '.b-navigation a[href]').forEach(function (a) {
+      var h = a.getAttribute('href') || '';
+      if (!h || h.indexOf('javascript') === 0 || h.charAt(0) === '#' || h.indexOf('q=') < 0) return;
+      h = abs(h);
+      if (h.indexOf(host()) !== 0 || pages.indexOf(h) >= 0) return;
+      pages.push(h);
+    });
+
+    return { list: list, pages: pages };
+  }
+
+  // Один запрос: первая страница выдачи + до двух следующих
+  function searchAll(q, ok, fail) {
+    var all = [], seen = {};
+
+    function add(list) {
+      list.forEach(function (i) {
+        if (!seen[i.url]) { seen[i.url] = 1; all.push(i); }
+      });
+    }
+
+    request(searchUrl(q), false, function (html) {
+      var p = parseSearch(html);
+      add(p.list);
+
+      var pages = p.pages.slice(0, 2);
+      if (!pages.length && p.list.length >= 8) pages = [searchUrl(q) + '&page=2'];
+
+      var i = 0;
+      (function next() {
+        if (i >= pages.length) return ok(all);
+        request(pages[i++], false, function (h) {
+          add(parseSearch(h).list);
+          next();
+        }, function () { next(); });
+      })();
     }, fail);
   }
 
-  function rank(list, q, year) {
-    var nq = norm(q);
-    list.forEach(function (i) {
-      var nt = norm(i.title), s = 0;
-      if (nt === nq) s += 2;
-      else if (nt && nq && (nt.indexOf(nq) >= 0 || nq.indexOf(nt) >= 0)) s += 1;
+  function rank(list, names, year, serial) {
+    var nn = names.map(norm).filter(Boolean);
+
+    list.forEach(function (i, idx) {
+      var nt = norm(cleanTitle(i.title)), s = 0, best = 0;
+
+      nn.forEach(function (nq) {
+        var t = 0;
+        if (nt === nq) t = 4;
+        else if (nt.length > 2 && nq && (nt.indexOf(nq) >= 0 || nq.indexOf(nt) >= 0)) t = 2;
+        else {
+          var a = nt.split(' '), b = nq.split(' '), hit = 0;
+          b.forEach(function (w) { if (w.length > 2 && a.indexOf(w) >= 0) hit++; });
+          if (b.length && hit / b.length >= 0.6) t = 1;
+        }
+        if (t > best) best = t;
+      });
+      s += best;
+
       if (year && i.year) {
-        if (i.year === year) s += 2;
-        else if (Math.abs(parseInt(i.year, 10) - parseInt(year, 10)) === 1) s += 1;
+        var d = Math.abs(parseInt(i.year, 10) - parseInt(year, 10));
+        s += d === 0 ? 3 : d === 1 ? 1 : -3;
       }
+
+      // фильм не должен подменяться сериалом и наоборот
+      if (serial && !CAT_SERIAL.test(i.url)) s -= 3;
+      if (!serial && !CAT_FILM.test(i.url)) s -= 3;
+
+      // нашлось и по русскому, и по оригинальному названию — почти наверняка то самое
+      s += ((i.hits || 1) - 1) * 2;
+
       i.score = s;
+      i.idx = idx;
     });
-    return list.sort(function (a, b) { return b.score - a.score; });
+
+    return list.sort(function (a, b) { return b.score - a.score || a.idx - b.idx; });
+  }
+
+  function isSure(list) {
+    var a = list[0], b = list[1];
+    return !!a && a.score >= 5 && (!b || a.score - b.score >= 2);
   }
 
   /* ====================================================================
@@ -352,7 +443,13 @@
         }
       };
 
-      filter.render().find('.filter--search, .filter--sort').addClass('hide');
+      filter.onSearch = function (value) {
+        if (!value) return;
+        _this.reset();
+        _this.find(value);
+      };
+      filter.render().find('.filter--sort').addClass('hide');
+      filter.render().find('.filter--search').appendTo(filter.render().find('.torrent-filter'));
       if (filter.addButtonBack) filter.addButtonBack();
 
       scroll.body().addClass('torrent-list');
@@ -374,22 +471,46 @@
       });
     };
 
-    this.find = function (useOriginal) {
+    this.find = function (custom) {
       var _this = this;
-      var q = useOriginal ? (movie.original_title || movie.original_name) : (movie.title || movie.name);
       var year = ((movie.release_date || movie.first_air_date || '') + '').slice(0, 4);
+      var serial = !!movie.name;
+      var title = movie.title || movie.name;
+      var orig = movie.original_title || movie.original_name;
 
-      search(q, function (list) {
-        if (!list.length) {
-          if (!useOriginal && (movie.original_title || movie.original_name)) return _this.find(true);
-          return _this.empty();
-        }
-        list = rank(list, q, year);
-        if (list.length === 1 || (list[0].score >= 4 && (!list[1] || list[1].score < list[0].score))) _this.open(list[0]);
-        else _this.similars(list.slice(0, 20));
-      }, function (e) {
-        _this.fail(e, 'Не удалось выполнить поиск на ' + host());
-      });
+      var names = custom ? [custom] : uniq([title, orig]);
+      var queries = custom ? [custom] : uniq([title, orig, shortTitle(title), shortTitle(orig)]);
+
+      var all = [], seen = {}, qi = 0;
+
+      function merge(list) {
+        list.forEach(function (i) {
+          if (seen[i.url]) seen[i.url].hits++;
+          else { i.hits = 1; seen[i.url] = i; all.push(i); }
+        });
+      }
+
+      function finish() {
+        if (!all.length) return _this.empty();
+
+        var list = rank(all, names, year, serial);
+
+        if (list.length === 1 || (!custom && isSure(list))) _this.open(list[0]);
+        else _this.similars(list.slice(0, 30));
+      }
+
+      (function next() {
+        if (qi >= queries.length) return finish();
+
+        searchAll(queries[qi++], function (list) {
+          merge(list);
+          if (!custom && all.length && isSure(rank(all, names, year, serial))) return finish();
+          next();
+        }, function (e) {
+          if (all.length) finish();
+          else _this.fail(e, 'Не удалось выполнить поиск на ' + host());
+        });
+      })();
     };
 
     this.similars = function (list) {
@@ -688,7 +809,7 @@
     };
 
     this.empty = function () {
-      this.message('Ничего не найдено', 'Поиск на Rezka не дал результатов');
+      this.message('Ничего не найдено', 'Поиск на Rezka не дал результатов. Нажмите «Поиск» в верхней панели и введите название вручную.');
     };
 
     this.reset = function () {
