@@ -5,7 +5,7 @@
   window.rezka_own_plugin = true;
 
   var VERSION = '1.2.0';
-  var DEFAULT_HOST = 'https://rezka.ag';
+  var DEFAULT_HOST = 'https://rezka.fi';
   var pending = [];     // активные запросы (чтобы можно было отменить)
 
   // Конфиг подставляет сервер, когда отдаёт ссылку на плагин: {api, token, host}
@@ -119,6 +119,9 @@
     if (status === 0) {
       return { title: 'Нет связи с сервером', text: 'Не удалось подключиться к ' + (api() || 'серверу плагина') + '. Проверьте интернет и адрес сервера в настройках.' };
     }
+    if (code === 'upstream') return { title: 'Rezka вернула ошибку', text: msg };
+    if (code === 'worker') return { title: 'Ошибка воркера', text: msg };
+    if (status === 500) return { title: 'Ошибка воркера', text: 'HTTP 500 без пояснения — смотрите Workers → Logs в Cloudflare.' };
     if (msg) return { title: 'Ошибка', text: msg };
     return { title: 'Ошибка сети', text: 'Сервер ответил с ошибкой (HTTP ' + status + ').' };
   }
