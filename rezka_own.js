@@ -4,7 +4,7 @@
   if (window.rezka_own_plugin) return;
   window.rezka_own_plugin = true;
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var DEFAULT_HOST = 'https://rezka.ag';
   var pending = [];     // активные запросы (чтобы можно было отменить)
 
@@ -73,6 +73,54 @@
 
   function norm(s) {
     return (s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').replace(/^\s+|\s+$/g, '');
+  }
+
+  function stripTags(s) {
+    return String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+  }
+
+  /* ====================================================================
+   *  Причины ошибок: подписка / сессия / токен / сеть
+   * ==================================================================== */
+
+  var MSG_PREMIUM = 'У аккаунта нет подписки Rezka Premium. Оформите её на сайте Rezka под этим же аккаунтом — и повторите.';
+
+  // Фраза вида «необходима подписка», «доступно только с Premium» и т.п.
+  function needsPremium(text) {
+    text = stripTags(text);
+    return /(необходим|нужн|требу|доступн|только)[^.!?]{0,60}(подписк|premium|премиум)|(подписк|premium|премиум)[^.!?]{0,60}(необходим|нужн|требу|оформ|истек|истёк|закончил)/i.test(text);
+  }
+
+  function errBody(e) {
+    var t = e && (e.responseText || (e.currentTarget && e.currentTarget.responseText));
+    return typeof t === 'string' ? t : '';
+  }
+
+  // Превращает ошибку запроса в {premium, title, text}
+  function explain(e) {
+    var status = e && e.status ? parseInt(e.status, 10) : 0;
+    var raw = errBody(e);
+    var body = parseJson(raw);
+    var msg = body && body.error ? String(body.error) : '';
+    var code = body && body.code ? body.code : '';
+
+    if (status === 402 || code === 'premium' || needsPremium(msg)) {
+      return { premium: true, title: 'Нет подписки Rezka', text: MSG_PREMIUM };
+    }
+    if (code === 'session') {
+      return { title: 'Сессия Rezka истекла', text: 'Войдите заново на странице сервера и установите плагин по новой ссылке.' };
+    }
+    if (status === 404 && /токен/i.test(msg)) {
+      return { title: 'Токен не найден', text: 'Создайте ссылку на плагин заново на странице сервера.' };
+    }
+    if (status === 401 || status === 403) {
+      return { title: 'Rezka отказала в доступе', text: 'HTTP ' + status + '. Вероятно, у аккаунта нет подписки Premium, либо сессия устарела — создайте ссылку заново.' };
+    }
+    if (status === 0) {
+      return { title: 'Нет связи с сервером', text: 'Не удалось подключиться к ' + (api() || 'серверу плагина') + '. Проверьте интернет и адрес сервера в настройках.' };
+    }
+    if (msg) return { title: 'Ошибка', text: msg };
+    return { title: 'Ошибка сети', text: 'Сервер ответил с ошибкой (HTTP ' + status + ').' };
   }
 
   function abortAll() {
@@ -233,10 +281,20 @@
 
     request(host() + '/ajax/get_cdn_series/?t=' + Date.now(), form(body), function (text) {
       var j = parseJson(text);
-      if (!j || !j.success || !j.url) return fail(j && j.message ? String(j.message).replace(/<[^>]+>/g, '') : '');
+      var msg = j && j.message ? stripTags(j.message) : '';
+
+      if (!j) {
+        if (needsPremium(text)) return fail({ premium: true, text: MSG_PREMIUM });
+        return fail({ text: 'Rezka вернула неожиданный ответ' });
+      }
+      if (!j.success || !j.url) {
+        if (needsPremium(msg)) return fail({ premium: true, text: MSG_PREMIUM });
+        return fail({ text: msg || 'Rezka не отдала ссылку на видео' });
+      }
+
       var s = parseStreams(j.url, j.subtitle);
-      if (s) ok(s); else fail('');
-    }, function () { fail(''); });
+      if (s) ok(s); else fail({ text: 'Rezka вернула пустой список качеств' });
+    }, function (e) { fail(explain(e)); });
   }
 
   /* ====================================================================
@@ -326,8 +384,8 @@
         list = rank(list, q, year);
         if (list.length === 1 || (list[0].score >= 4 && (!list[1] || list[1].score < list[0].score))) _this.open(list[0]);
         else _this.similars(list.slice(0, 20));
-      }, function () {
-        _this.message('Ошибка сети', 'Не удалось выполнить поиск на ' + host());
+      }, function (e) {
+        _this.fail(e, 'Не удалось выполнить поиск на ' + host());
       });
     };
 
@@ -352,11 +410,12 @@
 
       request(item.url, false, function (html) {
         if (!_this.parsePage(html, item)) {
+          if (needsPremium(html)) return _this.premium();
           return _this.message('Не найдено', 'Не удалось прочитать страницу (изменилась разметка или нет доступа).');
         }
         _this.onVoice();
-      }, function () {
-        _this.message('Ошибка сети', 'Не удалось открыть страницу на ' + host());
+      }, function (e) {
+        _this.fail(e, 'Не удалось открыть страницу на ' + host());
       });
     };
 
@@ -428,7 +487,11 @@
         action: 'get_episodes'
       }), function (text) {
         var j = parseJson(text);
-        if (!j || !j.success) return _this.message('Нет серий', (j && j.message) ? String(j.message).replace(/<[^>]+>/g, '') : 'Rezka не вернул список серий');
+        var em = j && j.message ? stripTags(j.message) : '';
+        if (!j || !j.success) {
+          if (needsPremium(em) || (!j && needsPremium(text))) return _this.premium();
+          return _this.message('Нет серий', em || 'Rezka не вернул список серий');
+        }
 
         st.episodes = qsa(dom(j.episodes), '.b-simple_episode__item').map(function (el) {
           return {
@@ -453,8 +516,8 @@
         if (!ok && st.seasons.length) st.season = st.seasons[0].id;
 
         _this.showEpisodes();
-      }, function () {
-        _this.message('Ошибка сети', 'Не удалось получить список серий');
+      }, function (e) {
+        _this.fail(e, 'Не удалось получить список серий');
       });
     };
 
@@ -594,9 +657,10 @@
 
         Lampa.Player.play(first);
         Lampa.Player.playlist(playlist);
-      }, function (msg) {
+      }, function (x) {
         Lampa.Loading.stop();
-        Lampa.Noty.show(msg || 'Не удалось получить ссылку');
+        x = x || {};
+        Lampa.Noty.show('Rezka: ' + (x.text || 'Не удалось получить ссылку'), { time: 6000 });
       });
     };
 
@@ -607,6 +671,17 @@
       scroll.clear();
       scroll.append(html);
       this.loading(false);
+    };
+
+    this.premium = function () {
+      this.message('Нет подписки Rezka', MSG_PREMIUM);
+    };
+
+    // Показывает понятную причину вместо общего «ошибка сети»
+    this.fail = function (e, fallbackText) {
+      var x = explain(e);
+      if (x.premium) return this.premium();
+      this.message(x.title, x.text || fallbackText);
     };
 
     this.empty = function () {
@@ -732,7 +807,7 @@
           if (j && j.ok) Lampa.Noty.show('Rezka: сервер работает, сайт ответил (HTTP ' + j.http + ')');
           else Lampa.Noty.show('Rezka: ' + ((j && j.error) || 'неожиданный ответ сервера'));
         }, function (e) {
-          Lampa.Noty.show(e && e.status === 404 ? 'Rezka: токен не найден, создайте ссылку заново' : 'Rezka: нет связи с сервером ' + api());
+          Lampa.Noty.show('Rezka: ' + explain(e).text);
         }, false, { dataType: 'text', timeout: 15000 });
       }
     });
