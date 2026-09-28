@@ -4,10 +4,12 @@
   if (window.rezka_own_plugin) return;
   window.rezka_own_plugin = true;
 
-  var VERSION = '1.0.0';
-  var DEFAULT_HOST = 'https://rezka.fi';
-  var logged = false;   // вход уже выполнен в этой сессии
+  var VERSION = '1.1.0';
+  var DEFAULT_HOST = 'https://rezka.ag';
   var pending = [];     // активные запросы (чтобы можно было отменить)
+
+  // Конфиг подставляет сервер, когда отдаёт ссылку на плагин: {api, token, host}
+  var boot = window.rezka_own_cfg || null;
 
   /* ====================================================================
    *  Настройки / утилиты
@@ -24,9 +26,16 @@
     return h.replace(/\/+$/, '');
   }
 
-  function proxify(url) {
-    var p = cfg('proxy');
-    return p ? p.replace('{url}', encodeURIComponent(url)) : url;
+  function api() {
+    return (cfg('api') || '').replace(/\/+$/, '');
+  }
+
+  // Токен из ссылки запоминаем в локальном хранилище Лампы
+  function applyBoot() {
+    if (!boot || !boot.token || !boot.api) return;
+    Lampa.Storage.set('rz_api', boot.api);
+    Lampa.Storage.set('rz_token', boot.token);
+    if (boot.host) Lampa.Storage.set('rz_host', boot.host);
   }
 
   function form(obj) {
@@ -75,82 +84,31 @@
    *  Сеть
    * ==================================================================== */
 
-  function request(url, post, ok, fail, returnHeaders) {
-    var net = new Lampa.Reguest();
-    var headers = { 'X-Requested-With': 'XMLHttpRequest' };
-    var cookie = cfg('cookie');
+  // Все запросы идут через сервер: он подставляет cookie аккаунта и CORS-заголовки
+  function proxied(url) {
+    return api() + '/' + cfg('token') + '/p?u=' + encodeURIComponent(url);
+  }
 
-    if (cookie) headers['Cookie'] = cookie;
-    if (post) headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+  function request(url, post, ok, fail) {
+    if (!api() || !cfg('token')) return fail && fail({ status: 0 });
+
+    var net = new Lampa.Reguest();
+    var opt = { dataType: 'text', timeout: 20000 };
+
+    if (post) opt.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
 
     pending.push(net);
 
-    net['native'](proxify(url), function (data) {
+    net['native'](proxied(url), function (data) {
       ok(unwrap(data), data);
     }, function (e) {
       if (fail) fail(e);
-    }, post || false, {
-      dataType: 'text',
-      headers: headers,
-      timeout: 15000,
-      returnHeaders: !!returnHeaders
-    });
-  }
-
-  // Пытаемся достать cookie из ответа (работает не на всех платформах)
-  function grabCookies(obj) {
-    var raw = '';
-    try {
-      var h = obj && (obj.headers || (obj.currentTarget && obj.currentTarget.headers));
-      if (h) {
-        raw = h['set-cookie'] || h['Set-Cookie'] || '';
-        if (raw.join) raw = raw.join('\n');
-      } else if (obj && obj.getResponseHeader) {
-        raw = obj.getResponseHeader('set-cookie') || '';
-      }
-    } catch (e) {}
-
-    var out = {}, m, re = /(dle_user_id|dle_password|PHPSESSID)=([^;,\s]+)/g;
-    while ((m = re.exec(raw))) if (m[2] !== 'deleted') out[m[1]] = m[2];
-
-    var parts = [];
-    for (var k in out) parts.push(k + '=' + out[k]);
-    return parts.join('; ');
-  }
-
-  /* ====================================================================
-   *  Rezka: вход
-   * ==================================================================== */
-
-  function login(ok, fail) {
-    var l = cfg('login'), p = cfg('password');
-    if (!l || !p) return fail('Не указаны логин и пароль (Настройки → Rezka)');
-
-    request(host() + '/ajax/login/', form({
-      login_name: l,
-      login_password: p,
-      login_not_save: 0
-    }), function (text, raw) {
-      var j = parseJson(text);
-      if (j && j.success) {
-        var ck = grabCookies(raw);
-        if (ck) Lampa.Storage.set('rz_cookie', ck);
-        logged = true;
-        ok();
-      } else {
-        fail((j && j.message) ? String(j.message).replace(/<[^>]+>/g, '') : 'Не удалось войти');
-      }
-    }, function () {
-      fail('Нет связи с ' + host());
-    }, true);
+    }, post || false, opt);
   }
 
   function ensureLogin(ok, fail) {
-    if (logged) return ok();
-    login(ok, function (err) {
-      // если вход не удался, но есть сохранённый cookie — пробуем работать с ним
-      if (cfg('cookie')) { logged = true; ok(); } else fail(err);
-    });
+    if (api() && cfg('token')) return ok();
+    fail('Плагин не подключён к серверу. Откройте страницу сервера, введите логин и пароль от Rezka и установите плагин по выданной ссылке.');
   }
 
   /* ====================================================================
@@ -351,7 +309,7 @@
     this.begin = function () {
       var _this = this;
       ensureLogin(function () { _this.find(); }, function (err) {
-        _this.message('Rezka: ошибка входа', err);
+        _this.message('Rezka: нет подключения', err);
       });
     };
 
@@ -744,53 +702,45 @@
 
     Lampa.SettingsApi.addParam({
       component: 'rezka_own',
+      param: { name: 'rz_api', type: 'input', values: '', 'default': '', placeholder: 'https://rezka-gate.example.workers.dev' },
+      field: { name: 'Адрес сервера', description: 'Заполняется автоматически при установке плагина по ссылке с сервера' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'rezka_own',
+      param: { name: 'rz_token', type: 'input', values: '', 'default': '', placeholder: 'токен' },
+      field: { name: 'Токен', description: 'Выдаётся на странице сервера после входа в аккаунт Rezka' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'rezka_own',
       param: { name: 'rz_host', type: 'input', values: '', 'default': DEFAULT_HOST, placeholder: DEFAULT_HOST },
-      field: { name: 'Адрес сайта (зеркало)', description: 'Например https://rezka.ag — если домен сменился, укажите рабочее зеркало' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'rezka_own',
-      param: { name: 'rz_login', type: 'input', values: '', 'default': '', placeholder: 'логин или e-mail' },
-      field: { name: 'Логин', description: 'Логин от вашего аккаунта Rezka' },
-      onChange: function () { logged = false; }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'rezka_own',
-      param: { name: 'rz_password', type: 'input', values: '', 'default': '', placeholder: 'пароль' },
-      field: { name: 'Пароль', description: 'Пароль от вашего аккаунта Rezka' },
-      onChange: function () { logged = false; }
+      field: { name: 'Адрес сайта (зеркало)', description: 'Должен совпадать с адресом, для которого создан токен. Сменился домен — создайте новую ссылку на сервере' }
     });
 
     Lampa.SettingsApi.addParam({
       component: 'rezka_own',
       param: { name: 'rz_check', type: 'button' },
-      field: { name: 'Войти / проверить вход', description: 'Выполнить вход с указанными данными' },
+      field: { name: 'Проверить подключение', description: 'Проверить, что сервер и токен работают, а сайт отвечает' },
       onChange: function () {
-        logged = false;
-        Lampa.Noty.show('Rezka: выполняю вход…');
-        login(function () {
-          Lampa.Noty.show('Rezka: вход выполнен' + (cfg('cookie') ? '' : ' (cookie не получены, см. поле «Cookie»)'));
-        }, function (err) {
-          Lampa.Noty.show('Rezka: ' + err);
-        });
+        if (!api() || !cfg('token')) return Lampa.Noty.show('Rezka: не указан адрес сервера или токен');
+
+        Lampa.Noty.show('Rezka: проверяю…');
+
+        new Lampa.Reguest()['native'](api() + '/' + cfg('token') + '/status', function (data) {
+          var j = parseJson(unwrap(data));
+          if (j && j.ok) Lampa.Noty.show('Rezka: сервер работает, сайт ответил (HTTP ' + j.http + ')');
+          else Lampa.Noty.show('Rezka: ' + ((j && j.error) || 'неожиданный ответ сервера'));
+        }, function (e) {
+          Lampa.Noty.show(e && e.status === 404 ? 'Rezka: токен не найден, создайте ссылку заново' : 'Rezka: нет связи с сервером ' + api());
+        }, false, { dataType: 'text', timeout: 15000 });
       }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'rezka_own',
-      param: { name: 'rz_cookie', type: 'input', values: '', 'default': '', placeholder: 'dle_user_id=...; dle_password=...' },
-      field: { name: 'Cookie (необязательно)', description: 'Заполняется автоматически после входа. Можно вставить вручную dle_user_id и dle_password из браузера' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'rezka_own',
-      param: { name: 'rz_proxy', type: 'input', values: '', 'default': '', placeholder: 'https://my.proxy/?u={url}' },
-      field: { name: 'Прокси (необязательно)', description: 'Шаблон адреса прокси, {url} будет заменён на адрес запроса. Нужен, если сайт блокирует запросы из Lampa (CORS)' }
     });
   }
 
   function start() {
+    applyBoot();
+
     Lampa.Template.add('rezka_css', '<style>' +
       '.online-prestige{position:relative;border-radius:.3em;background-color:rgba(0,0,0,.3);display:flex}' +
       '.online-prestige__body{padding:1.2em;line-height:1.3;flex-grow:1;position:relative}' +
